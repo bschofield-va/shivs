@@ -1,0 +1,204 @@
+
+usage() {
+cat <<EOF
+$0 [options] command
+
+Kubernetes support tool.
+
+Commands
+ m | set-master <ip>      Set the master node IP for use with other commands
+ s | ssh                  SSH to the master
+ w | ssh-worker           SSH to a worker node
+ t | tail-logs <env> <namespace> <pattern>
+                          Tail the logs of all of the pods in all AZs
+ lm | list-masters <env>  List the IP addresses of the master nodes
+ lw | list-workers        List the IP addresses of worker nodes
+ gc | get-content         Pull content folder from the master
+ sc | set-content         Push the local content folder to the master
+ bl | tail-boot-log       Tail the master boot log
+
+Environment Variables
+ JK_CONF  The configuration file of other environment variables. This is sourced if found.
+ MASTER   The IP address of the Master node.
+
+$1
+EOF
+exit 1
+}
+
+
+[ -z "$JK_CONF"] && JK_CONF=~/.jk
+[[ -z "$MASTER" && -f $JK_CONF ]] && . $JK_CONF
+
+BASE_DIR=$(dirname $(readlink -f $0))
+CONTENT_DIR=$BASE_DIR/../jk-content
+
+#set -x
+KEY=~/.ssh/DevToolsKeyPair.pem
+[ -z "$CONTENT" ] && CONTENT=".bryanrc jq dqq"
+
+MASTER_QA_A=10.247.88.88
+MASTER_QA_B=10.247.88.103
+MASTER_STAGING_A=10.247.109.48
+MASTER_STAGING_B=10.247.109.158
+# p26
+MASTER_PRODUCTION_A=10.247.44.81
+MASTER_PRODUCTION_B=10.247.44.155
+MASTER_PRODUCTION_C=10.247.43.146
+
+MASTER_STAGING_LAB_A=10.247.88.25
+MASTER_STAGING_LAB_B=10.247.88.38
+MASTER_LAB_A=10.247.108.4
+MASTER_LAB_B=10.247.108.60
+
+trap onExit EXIT
+onExit() {
+  [ -n "$PIDS" ] && kill $PIDS
+} 
+
+checkConf() {
+  [ -z "$MASTER" ] && usage "MASTER not defined"
+}
+
+
+setMaster() {
+  if [ -z "$MASTER" ]
+  then
+    [ -f $JK_CONF ] && cat $JK_CONF
+    select M in \
+      "QA a $MASTER_QA_A" \
+      "QA b $MASTER_QA_B" \
+      "Staging a $MASTER_STAGING_A" \
+      "Staging b $MASTER_STAGING_B" \
+      "Production a $MASTER_PRODUCTION_A" \
+      "Production b $MASTER_PRODUCTION_B" \
+      "Production c $MASTER_PRODUCTION_C" \
+      "Staging-Lab a $MASTER_STAGING_LAB_A" \
+      "Staging-Lab b $MASTER_STAGING_LAB_B" \
+      "Lab a $MASTER_LAB_A" \
+      "Lab b $MASTER_LAB_B"
+    do break; done
+    MASTER="${M##* }"
+    echo $MASTER
+  fi 
+  [ -f $JK_CONF ] && sed -i '/MASTER=/d' $JK_CONF
+  echo "MASTER=$MASTER" >> $JK_CONF
+  sshToMaster
+}
+
+sshToMaster() {
+  checkConf
+  ssh -q -i $KEY ec2-user@$MASTER
+}
+
+sshToWorker() {
+  checkConf
+  echo "Select worker node"
+  select worker in $(listWorkers)
+  do
+    [ -n "$worker" ] && break
+  done
+  ssh -q -i $KEY ec2-user@$worker
+}
+
+tailBootLogOfMaster() {
+  checkConf
+  ssh -q -i $KEY ec2-user@$MASTER tail -f /var/log/user-data.log
+}
+
+scpContentFromMaster() {
+  checkConf
+  for f in $CONTENT
+  do
+    echo "Fetching $f"
+    scp -q -i $KEY -r ec2-user@$MASTER:~/$f $CONTENT_DIR/$f
+  done
+}
+
+scpContentToMaster() {
+  checkConf
+  for f in $CONTENT
+  do
+    echo "Sending $f"
+    scp -q -i $KEY -r $CONTENT_DIR/$f ec2-user@$MASTER:~
+  done
+}
+
+listMasters() {
+  local env="${1,,}"
+  if [ -z "${env}" ]
+  then
+    for env in qa staging production staging-lab lab
+    do
+      echo "$env $(listMasters $env)"
+    done | column -t
+    return
+  fi
+  case $env in
+    qa) echo "$MASTER_QA_A $MASTER_QA_B"; exit 0;;
+    staging) echo "$MASTER_STAGING_A $MASTER_STAGING_B"; exit 0;;
+    production) echo "$MASTER_PRODUCTION_A $MASTER_PRODUCTION_B $MASTER_PRODUCTION_C"; exit 0;;
+    staging-lab) echo "$MASTER_STAGING_LAB_A $MASTER_STAGING_LAB_B"; exit 0;;
+    lab) echo "$MASTER_LAB_A $MASTER_LAB_B"; exit 0;;
+    *) echo "Unknown environment: $env"; exit 1;;
+  esac
+}
+
+listWorkers() {
+ checkConf
+ ssh -q -i $KEY ec2-user@$MASTER kubectl get nodes -o wide | awk '{ if ( $3 == "<none>") { print $6 } }'
+}
+
+workerUsage() {
+  local pods=$(mktemp)
+  ssh -q -i $KEY -o ConnectTimeout=10 ec2-user@$MASTER "kubectl get po -A --no-headers -o wide" > $pods 
+  for w in $MASTER $(listWorkers)
+  do
+    echo $w
+    ssh -q -i $KEY -o ConnectTimeout=10 ec2-user@$w "top -bn1 | grep '%Cpu' | sed 's/.*, *\([0-9.]*\)%* id.*/\1/'"
+    echo "idle"
+    ssh -q -i $KEY -o ConnectTimeout=10 ec2-user@$w "free -h" | awk '/Mem/ {print $4}'
+    echo "free"
+    grep -E "ip-$w.us" $pods | wc -l
+    echo "pods"
+    ssh -q -i $KEY -o ConnectTimeout=10 ec2-user@$w "ntpstat" | awk '/synchronised/ { printf "%s ",$5 } /time correct/ { print $5 " " $6}' 
+  done | paste -sd "       \n" | sort | column -t
+  rm $pods
+}
+
+tailLogs() {
+  local env="$1"
+  local namespace="$2"
+  local pattern="$3"
+  local options="$4"
+  [ -z "$env" ] && usage "Environment not specified"
+  [ -z "$namespace" ] && usage "Namespace not specified"
+  [ -z "$pattern" ] && usage "Pattern not specified"
+  [ "${DUMP:-false}" == true ] && DUMP_ARGS="export DUMP=true; export REMOVE=true;"
+  for master in $(listMasters $1)
+  do
+    echo "Transferring tail-logs to $master"
+    scp -q -i $KEY -o ConnectTimeout=10 $BASE_DIR/tail-logs ec2-user@$master:~/tail-logs
+    ssh -q -i $KEY -o ConnectTimeout=10 ec2-user@$master "${DUMP_ARGS:-} bash /home/ec2-user/tail-logs $namespace $pattern $options" &
+    PIDS+=" $!"
+  done
+  wait
+}
+
+COMMAND=$1
+[ -z "$COMMAND" ] && usage "No command specified"
+
+
+case "$COMMAND" in
+  m|set-master) MASTER=$2; setMaster;;
+  s|ssh) sshToMaster;;
+  gc|get-content) scpContentFromMaster;;
+  sc|set-content) scpContentToMaster;;
+  bl|tail-boot-log) tailBootLogOfMaster;;
+  lm|list-masters) listMasters $2;;
+  lw|list-workers) listWorkers;;
+  w|ssh-worker) sshToWorker;;
+  f|free|worker-free-resources) workerUsage;;
+  t|tail-logs) tailLogs $2 $3 $4 $5;;
+  *) usage "Unknown command: $COMMAND"
+esac

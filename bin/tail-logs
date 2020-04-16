@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+
+NAMESPACE=$1
+FILTER="$2"
+OPTIONS="$3"
+[ -z "$FILTER" ] && echo "$0 <filter>" && exit 1
+
+
+echo "Tailing $1 $2"
+
+PIDS=
+onExit() {
+  [ -n "$PIDS" ] && kill $PIDS
+}
+trap onExit EXIT
+
+LOGS=
+for pod in $(kubectl get pods -n $NAMESPACE | cut -d ' ' -f 1 | grep -v NAME | grep -E -- "$FILTER")
+do
+  echo "Tailing $pod"
+  if [ "$DUMP" == true ]
+  then
+    LOGS+="$pod.log "
+    kubectl logs $OPTIONS -n $NAMESPACE $pod > $pod.log &
+    PIDS+=" $!"
+  else
+    kubectl logs $OPTIONS --tail=10 -f -n $NAMESPACE $pod & 
+    PIDS+=" $!"
+  fi
+done
+
+echo $PIDS
+if [ "$DUMP" == true ]
+then
+  wait
+  cat $LOGS
+  [ "$REMOVE" == true ] && rm $LOGS
+else
+  wait $PIDS
+fi
