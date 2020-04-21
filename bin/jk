@@ -65,6 +65,7 @@ setMaster() {
   if [ -z "$MASTER" ]
   then
     [ -f $JK_CONF ] && cat $JK_CONF
+    COLUMNS=12
     select M in \
       "QA a $MASTER_QA_A" \
       "QA b $MASTER_QA_B" \
