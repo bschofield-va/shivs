@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+q="$1"
+shift
+kubectl exec -i -n dq $(kubectl get po -n dq | grep -m 1 data-quer | cut -d ' ' -f 1) \
+  -- curl -s "http://localhost:8090$q" $@ \
+  | jq .
+
