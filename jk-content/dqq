@@ -1,7 +1,0 @@
-#!/usr/bin/env bash
-set -euo pipefail
-
-URI=$1
-POD=$(kubectl get po -n dq | awk '/data-query/ { print $1 ; exit 0 }')
-
-kubectl exec -n dq $POD -- curl -s "http://localhost:8090$URI" $@
